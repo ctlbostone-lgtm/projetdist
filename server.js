@@ -1,4 +1,4 @@
-// server.js
+// server.js - Version ultra-rapide avec heartbeat
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -12,54 +12,79 @@ const wss = new WebSocket.Server({ server, path: '/ws' });
 const espConnections = new Map();   // mac -> WebSocket
 const webClients = new Set();       // WebSocket (navigateurs)
 
-// Servir les fichiers statiques (frontend)
-app.use(express.static(path.join(__dirname, 'public')));
+// Heartbeat : ping toutes les 15 secondes pour garder la connexion active
+setInterval(() => {
+  // Ping vers tous les ESP32
+  for (const [mac, ws] of espConnections.entries()) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    } else {
+      espConnections.delete(mac);
+      broadcastToWebClients({ type: 'espDisconnected', mac });
+    }
+  }
+  // Ping vers les clients web (optionnel)
+  for (const client of webClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.ping();
+    } else {
+      webClients.delete(client);
+    }
+  }
+}, 15000);
 
-// Route principale
+// Servir les fichiers statiques (avec cache désactivé pour le développement)
+app.use(express.static(path.join(__dirname, 'public'), { etag: false, maxAge: 0 }));
+
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// WebSocket
 wss.on('connection', (ws, req) => {
   console.log('Nouvelle connexion WebSocket');
 
   let espMac = null;
 
+  // Réponse immédiate au ping (keepalive)
+  ws.on('pong', () => { /* heartbeat ok */ });
+
   ws.on('message', (data) => {
     const message = data.toString();
-    console.log('Message reçu:', message);
     try {
       const json = JSON.parse(message);
       const { type } = json;
 
       if (type === 'identify') {
-        // C'est un ESP32 qui s'identifie
         espMac = json.mac;
         espConnections.set(espMac, ws);
-        console.log(`ESP32 ${espMac} connecté`);
+        console.log(`✅ ESP32 ${espMac} connecté (instantané)`);
 
-        // Envoie l'état initial à tous les clients web
+        // Envoie immédiatement l'état initial à tous les clients web
         broadcastToWebClients({
           type: 'initStates',
-          states: json.initialStates
+          states: json.initialStates,
+          mac: espMac
         });
+        // Notifie la liste des ESP connectés
+        broadcastEspList();
       }
       else if (type === 'state') {
-        // Mise à jour d'état d'une broche depuis l'ESP32
+        // Relai instantané aux clients web
         broadcastToWebClients({
           type: 'stateUpdate',
           pin: json.pin,
-          state: json.state
+          state: json.state,
+          mac: espMac
         });
       }
       else if (type === 'command') {
-        // Commande provenant d'un client web → la rediriger vers l'ESP32
+        // Commande d'un client web vers un ESP spécifique
         const targetEsp = espConnections.get(json.targetMac);
         if (targetEsp && targetEsp.readyState === WebSocket.OPEN) {
           targetEsp.send(JSON.stringify(json.command));
         } else {
-          console.warn(`ESP32 ${json.targetMac} non connecté`);
+          // Notifier le client que l'ESP n'est pas joignable
+          ws.send(JSON.stringify({ type: 'error', message: 'ESP non connecté' }));
         }
       }
     } catch (err) {
@@ -70,7 +95,9 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     if (espMac) {
       espConnections.delete(espMac);
-      console.log(`ESP32 ${espMac} déconnecté`);
+      console.log(`❌ ESP32 ${espMac} déconnecté`);
+      broadcastToWebClients({ type: 'espDisconnected', mac: espMac });
+      broadcastEspList();
     } else {
       webClients.delete(ws);
       console.log('Client web déconnecté');
@@ -80,9 +107,8 @@ wss.on('connection', (ws, req) => {
   // Si ce n'est pas un ESP32, c'est un client web
   if (!espMac) {
     webClients.add(ws);
-    // Envoi de la liste des ESP actuellement connectés
-    const espList = Array.from(espConnections.keys());
-    ws.send(JSON.stringify({ type: 'espList', list: espList }));
+    // Envoi immédiat de la liste des ESP déjà connectés
+    ws.send(JSON.stringify({ type: 'espList', list: Array.from(espConnections.keys()) }));
   }
 });
 
@@ -95,7 +121,11 @@ function broadcastToWebClients(payload) {
   });
 }
 
-// Port dynamique pour Render
+function broadcastEspList() {
+  const list = Array.from(espConnections.keys());
+  broadcastToWebClients({ type: 'espList', list });
+}
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Serveur démarré sur http://localhost:${PORT}`);
