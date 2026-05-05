@@ -1,8 +1,11 @@
-// public/script.js
-const WS_URL = `wss://${window.location.host}/ws`;   // sur Render : wss://...
+// public/script.js - Version ultra-rapide avec heartbeat et état synchrone
 let ws = null;
-let currentEspMac = null;       // MAC de l'ESP32 sélectionné
+let currentEspMac = null;
 let espList = [];
+let pinStates = { 16: 0, 17: 0, 18: 0, 19: 0 };
+let reconnectAttempts = 0;
+
+const WS_URL = `wss://${window.location.host}/ws`;
 
 // Éléments DOM
 const wsStatusDiv = document.getElementById('wsStatus');
@@ -10,17 +13,14 @@ const espStatusDiv = document.getElementById('espStatus');
 const cardsGrid = document.getElementById('cardsGrid');
 const toastEl = document.getElementById('toast');
 
-// Broches concernées
-const pins = [16, 17, 18, 19];
-let pinStates = { 16: 0, 17: 0, 18: 0, 19: 0 };
-
-// Connexion WebSocket
+// Connexion WebSocket immédiate au chargement de la page
 function connectWebSocket() {
   ws = new WebSocket(WS_URL);
 
   ws.onopen = () => {
     wsStatusDiv.innerHTML = '<i class="fas fa-plug"></i> Connecté';
     wsStatusDiv.className = 'status online';
+    reconnectAttempts = 0;
     showToast('Connecté au serveur', 'success');
   };
 
@@ -29,7 +29,8 @@ function connectWebSocket() {
     wsStatusDiv.className = 'status offline';
     espStatusDiv.innerHTML = '<i class="fas fa-server"></i> Aucun ESP32';
     showToast('Connexion perdue, reconnexion...', 'error');
-    setTimeout(connectWebSocket, 3000);
+    // Reconnexion automatique avec backoff exponentiel
+    setTimeout(connectWebSocket, Math.min(1000 * (reconnectAttempts++), 10000));
   };
 
   ws.onerror = () => {
@@ -51,30 +52,60 @@ function handleServerMessage(msg) {
     case 'espList':
       espList = msg.list;
       if (espList.length > 0) {
-        currentEspMac = espList[0];
+        if (!currentEspMac || !espList.includes(currentEspMac)) {
+          currentEspMac = espList[0];
+        }
         espStatusDiv.innerHTML = `<i class="fas fa-server"></i> ESP: ${currentEspMac.slice(-6)}`;
+        // Demander les états actuels si besoin (optionnel: le serveur les renverra via initStates)
       } else {
         espStatusDiv.innerHTML = `<i class="fas fa-server"></i> Aucun ESP32 connecté`;
+        currentEspMac = null;
+        // Afficher les cartes en grisé
+        disableCards(true);
       }
       break;
 
     case 'initStates':
-      // Réception de l'état initial des broches depuis l'ESP
-      msg.states.forEach(s => {
-        pinStates[s.pin] = s.state;
-      });
-      renderCards();
+      // Réception initiale des états de toutes les broches
+      if (msg.states) {
+        msg.states.forEach(s => {
+          pinStates[s.pin] = s.state;
+        });
+        renderCards();  // Génère l'interface immédiatement
+        disableCards(false);
+      }
       break;
 
     case 'stateUpdate':
+      // Mise à jour en temps réel
       pinStates[msg.pin] = msg.state;
       updateCardUI(msg.pin, msg.state);
       showToast(`Broche ${msg.pin} → ${msg.state ? 'ON' : 'OFF'}`, 'info');
       break;
+
+    case 'espDisconnected':
+      if (currentEspMac === msg.mac) {
+        espStatusDiv.innerHTML = `<i class="fas fa-server"></i> ESP déconnecté !`;
+        disableCards(true);
+        showToast(`ESP32 ${msg.mac.slice(-6)} déconnecté`, 'error');
+      }
+      break;
+
+    case 'error':
+      showToast(msg.message, 'error');
+      break;
   }
 }
 
-// Envoi d'une commande à l'ESP (via le serveur)
+function disableCards(disabled) {
+  const btns = document.querySelectorAll('.btn, .timer-control button, .timer-control input');
+  btns.forEach(btn => {
+    btn.disabled = disabled;
+    if (disabled) btn.style.opacity = '0.5';
+    else btn.style.opacity = '1';
+  });
+}
+
 function sendCommand(command) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     showToast('WebSocket non connecté', 'error');
@@ -92,7 +123,6 @@ function sendCommand(command) {
   ws.send(JSON.stringify(payload));
 }
 
-// Actions immédiates
 function setPinImmediate(pin, state) {
   sendCommand({ type: 'set', pin: pin, state: state ? 1 : 0 });
 }
@@ -111,9 +141,9 @@ function programTimer(pin, delaySec, targetState) {
   showToast(`Temporisation programmée : broche ${pin} ${targetState ? 'ON' : 'OFF'} dans ${delaySec}s`, 'success');
 }
 
-// Rendu des cartes
 function renderCards() {
   cardsGrid.innerHTML = '';
+  const pins = [16, 17, 18, 19];
   pins.forEach(pin => {
     const state = pinStates[pin];
     const card = document.createElement('div');
@@ -143,7 +173,7 @@ function renderCards() {
     cardsGrid.appendChild(card);
   });
 
-  // Attacher les événements après création
+  // Attacher les événements
   document.querySelectorAll('.btn-on, .btn-off').forEach(btn => {
     btn.addEventListener('click', (e) => {
       const pin = parseInt(btn.dataset.pin);
@@ -178,5 +208,5 @@ function showToast(msg, type = 'info') {
   setTimeout(() => toastEl.classList.remove('show'), 2500);
 }
 
-// Initialisation
+// Démarrage immédiat
 connectWebSocket();
