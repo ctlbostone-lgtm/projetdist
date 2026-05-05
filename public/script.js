@@ -1,11 +1,11 @@
-// public/script.js - Version ultra-rapide avec heartbeat et état synchrone
+// public/script.js - Version ultra-rapide avec reconnexion automatique
 let ws = null;
 let currentEspMac = null;
-let espList = [];
 let pinStates = { 16: 0, 17: 0, 18: 0, 19: 0 };
 let reconnectAttempts = 0;
 
 const WS_URL = `wss://${window.location.host}/ws`;
+const pins = [16, 17, 18, 19];
 
 // Éléments DOM
 const wsStatusDiv = document.getElementById('wsStatus');
@@ -13,36 +13,41 @@ const espStatusDiv = document.getElementById('espStatus');
 const cardsGrid = document.getElementById('cardsGrid');
 const toastEl = document.getElementById('toast');
 
-// Connexion WebSocket immédiate au chargement de la page
+// Connexion WebSocket rapide avec backoff
 function connectWebSocket() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  
   ws = new WebSocket(WS_URL);
-
+  
   ws.onopen = () => {
     wsStatusDiv.innerHTML = '<i class="fas fa-plug"></i> Connecté';
     wsStatusDiv.className = 'status online';
     reconnectAttempts = 0;
     showToast('Connecté au serveur', 'success');
   };
-
+  
   ws.onclose = () => {
     wsStatusDiv.innerHTML = '<i class="fas fa-plug"></i> Déconnecté';
     wsStatusDiv.className = 'status offline';
     espStatusDiv.innerHTML = '<i class="fas fa-server"></i> Aucun ESP32';
     showToast('Connexion perdue, reconnexion...', 'error');
-    // Reconnexion automatique avec backoff exponentiel
-    setTimeout(connectWebSocket, Math.min(1000 * (reconnectAttempts++), 10000));
+    // Reconnexion exponentielle (1s, 1.5s, 2.25s, max 5s)
+    let delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 5000);
+    setTimeout(connectWebSocket, delay);
+    reconnectAttempts++;
   };
-
-  ws.onerror = () => {
-    console.error('WebSocket error');
+  
+  ws.onerror = (err) => {
+    console.error('WebSocket error:', err);
+    ws.close();
   };
-
+  
   ws.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data);
       handleServerMessage(data);
     } catch (e) {
-      console.warn('Message non JSON', event.data);
+      console.warn('Message non JSON:', event.data);
     }
   };
 }
@@ -50,70 +55,44 @@ function connectWebSocket() {
 function handleServerMessage(msg) {
   switch (msg.type) {
     case 'espList':
-      espList = msg.list;
-      if (espList.length > 0) {
-        if (!currentEspMac || !espList.includes(currentEspMac)) {
-          currentEspMac = espList[0];
-        }
+      if (msg.list && msg.list.length > 0) {
+        currentEspMac = msg.list[0];
         espStatusDiv.innerHTML = `<i class="fas fa-server"></i> ESP: ${currentEspMac.slice(-6)}`;
-        // Demander les états actuels si besoin (optionnel: le serveur les renverra via initStates)
       } else {
-        espStatusDiv.innerHTML = `<i class="fas fa-server"></i> Aucun ESP32 connecté`;
         currentEspMac = null;
-        // Afficher les cartes en grisé
-        disableCards(true);
+        espStatusDiv.innerHTML = '<i class="fas fa-server"></i> Aucun ESP32';
       }
       break;
-
+      
     case 'initStates':
-      // Réception initiale des états de toutes les broches
       if (msg.states) {
         msg.states.forEach(s => {
           pinStates[s.pin] = s.state;
         });
-        renderCards();  // Génère l'interface immédiatement
-        disableCards(false);
+        renderCards();
       }
       break;
-
+      
     case 'stateUpdate':
-      // Mise à jour en temps réel
       pinStates[msg.pin] = msg.state;
       updateCardUI(msg.pin, msg.state);
       showToast(`Broche ${msg.pin} → ${msg.state ? 'ON' : 'OFF'}`, 'info');
       break;
-
-    case 'espDisconnected':
-      if (currentEspMac === msg.mac) {
-        espStatusDiv.innerHTML = `<i class="fas fa-server"></i> ESP déconnecté !`;
-        disableCards(true);
-        showToast(`ESP32 ${msg.mac.slice(-6)} déconnecté`, 'error');
-      }
-      break;
-
-    case 'error':
-      showToast(msg.message, 'error');
+      
+    default:
       break;
   }
 }
 
-function disableCards(disabled) {
-  const btns = document.querySelectorAll('.btn, .timer-control button, .timer-control input');
-  btns.forEach(btn => {
-    btn.disabled = disabled;
-    if (disabled) btn.style.opacity = '0.5';
-    else btn.style.opacity = '1';
-  });
-}
-
+// Envoi d'une commande à l'ESP via le serveur
 function sendCommand(command) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     showToast('WebSocket non connecté', 'error');
-    return;
+    return false;
   }
   if (!currentEspMac) {
     showToast('Aucun ESP32 disponible', 'error');
-    return;
+    return false;
   }
   const payload = {
     type: 'command',
@@ -121,8 +100,10 @@ function sendCommand(command) {
     command: command
   };
   ws.send(JSON.stringify(payload));
+  return true;
 }
 
+// Actions immédiates
 function setPinImmediate(pin, state) {
   sendCommand({ type: 'set', pin: pin, state: state ? 1 : 0 });
 }
@@ -132,18 +113,20 @@ function programTimer(pin, delaySec, targetState) {
     showToast('Le délai doit être ≥ 1 seconde', 'error');
     return;
   }
-  sendCommand({
+  if (sendCommand({
     type: 'timer',
     pin: pin,
     state: targetState ? 1 : 0,
     delay: parseInt(delaySec)
-  });
-  showToast(`Temporisation programmée : broche ${pin} ${targetState ? 'ON' : 'OFF'} dans ${delaySec}s`, 'success');
+  })) {
+    showToast(`Temporisation programmée : broche ${pin} ${targetState ? 'ON' : 'OFF'} dans ${delaySec}s`, 'success');
+  }
 }
 
+// Génération des cartes dynamiques
 function renderCards() {
+  if (!cardsGrid) return;
   cardsGrid.innerHTML = '';
-  const pins = [16, 17, 18, 19];
   pins.forEach(pin => {
     const state = pinStates[pin];
     const card = document.createElement('div');
@@ -172,8 +155,8 @@ function renderCards() {
     `;
     cardsGrid.appendChild(card);
   });
-
-  // Attacher les événements
+  
+  // Attacher les événements après création
   document.querySelectorAll('.btn-on, .btn-off').forEach(btn => {
     btn.addEventListener('click', (e) => {
       const pin = parseInt(btn.dataset.pin);
@@ -203,10 +186,13 @@ function updateCardUI(pin, state) {
 }
 
 function showToast(msg, type = 'info') {
+  if (!toastEl) return;
   toastEl.innerText = msg;
   toastEl.classList.add('show');
   setTimeout(() => toastEl.classList.remove('show'), 2500);
 }
 
-// Démarrage immédiat
-connectWebSocket();
+// Initialisation au chargement de la page
+document.addEventListener('DOMContentLoaded', () => {
+  connectWebSocket();
+});
