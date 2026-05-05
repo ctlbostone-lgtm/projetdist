@@ -1,4 +1,4 @@
-// public/script.js - Version ultra-rapide avec reconnexion automatique
+// public/script.js - Version avec affichage permanent des boutons
 let ws = null;
 let currentEspMac = null;
 let pinStates = { 16: 0, 17: 0, 18: 0, 19: 0 };
@@ -13,7 +13,7 @@ const espStatusDiv = document.getElementById('espStatus');
 const cardsGrid = document.getElementById('cardsGrid');
 const toastEl = document.getElementById('toast');
 
-// Connexion WebSocket rapide avec backoff
+// Connexion WebSocket robuste
 function connectWebSocket() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
   
@@ -24,6 +24,8 @@ function connectWebSocket() {
     wsStatusDiv.className = 'status online';
     reconnectAttempts = 0;
     showToast('Connecté au serveur', 'success');
+    // Demander la liste des ESP (utile si le serveur ne l'envoie pas automatiquement)
+    // Le serveur envoie espList à la connexion du client, donc pas besoin.
   };
   
   ws.onclose = () => {
@@ -31,7 +33,6 @@ function connectWebSocket() {
     wsStatusDiv.className = 'status offline';
     espStatusDiv.innerHTML = '<i class="fas fa-server"></i> Aucun ESP32';
     showToast('Connexion perdue, reconnexion...', 'error');
-    // Reconnexion exponentielle (1s, 1.5s, 2.25s, max 5s)
     let delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 5000);
     setTimeout(connectWebSocket, delay);
     reconnectAttempts++;
@@ -69,7 +70,7 @@ function handleServerMessage(msg) {
         msg.states.forEach(s => {
           pinStates[s.pin] = s.state;
         });
-        renderCards();
+        renderCards(); // Met à jour l'affichage avec les bons états
       }
       break;
       
@@ -84,7 +85,6 @@ function handleServerMessage(msg) {
   }
 }
 
-// Envoi d'une commande à l'ESP via le serveur
 function sendCommand(command) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     showToast('WebSocket non connecté', 'error');
@@ -103,7 +103,6 @@ function sendCommand(command) {
   return true;
 }
 
-// Actions immédiates
 function setPinImmediate(pin, state) {
   sendCommand({ type: 'set', pin: pin, state: state ? 1 : 0 });
 }
@@ -123,12 +122,13 @@ function programTimer(pin, delaySec, targetState) {
   }
 }
 
-// Génération des cartes dynamiques
+// Crée ou met à jour l'affichage des cartes (toujours présent)
 function renderCards() {
   if (!cardsGrid) return;
+  // On vide la grille et on recrée pour être sûr d'avoir les bons états
   cardsGrid.innerHTML = '';
   pins.forEach(pin => {
-    const state = pinStates[pin];
+    const state = pinStates[pin] === 1; // boolean
     const card = document.createElement('div');
     card.className = 'card';
     card.id = `card-${pin}`;
@@ -137,7 +137,7 @@ function renderCards() {
         <span class="pin-badge"><i class="fas fa-tag"></i> GPIO ${pin}</span>
         <div class="led-indicator">
           <div class="led ${state ? 'on' : ''}" id="led-${pin}"></div>
-          <span>${state ? 'ALLUMÉ' : 'ÉTEINT'}</span>
+          <span id="state-text-${pin}">${state ? 'ALLUMÉ' : 'ÉTEINT'}</span>
         </div>
       </div>
       <div class="actions">
@@ -158,21 +158,31 @@ function renderCards() {
   
   // Attacher les événements après création
   document.querySelectorAll('.btn-on, .btn-off').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      const pin = parseInt(btn.dataset.pin);
-      const state = parseInt(btn.dataset.state);
-      setPinImmediate(pin, state);
-    });
+    btn.removeEventListener('click', handleImmediateClick);
+    btn.addEventListener('click', handleImmediateClick);
   });
   document.querySelectorAll('.timer-on, .timer-off').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      const pin = parseInt(btn.dataset.pin);
-      const targetState = parseInt(btn.dataset.state);
-      const delayInput = document.getElementById(`delay-${pin}`);
-      const delaySec = parseInt(delayInput.value);
-      programTimer(pin, delaySec, targetState === 1);
-    });
+    btn.removeEventListener('click', handleTimerClick);
+    btn.addEventListener('click', handleTimerClick);
   });
+}
+
+function handleImmediateClick(e) {
+  const btn = e.currentTarget;
+  const pin = parseInt(btn.dataset.pin);
+  const state = parseInt(btn.dataset.state);
+  setPinImmediate(pin, state);
+}
+
+function handleTimerClick(e) {
+  const btn = e.currentTarget;
+  const pin = parseInt(btn.dataset.pin);
+  const targetState = parseInt(btn.dataset.state);
+  const delayInput = document.getElementById(`delay-${pin}`);
+  if (delayInput) {
+    const delaySec = parseInt(delayInput.value);
+    programTimer(pin, delaySec, targetState === 1);
+  }
 }
 
 function updateCardUI(pin, state) {
@@ -180,8 +190,10 @@ function updateCardUI(pin, state) {
   if (ledDiv) {
     if (state) ledDiv.classList.add('on');
     else ledDiv.classList.remove('on');
-    const stateSpan = ledDiv.parentElement.querySelector('span');
-    if (stateSpan) stateSpan.innerText = state ? 'ALLUMÉ' : 'ÉTEINT';
+  }
+  const stateSpan = document.getElementById(`state-text-${pin}`);
+  if (stateSpan) {
+    stateSpan.innerText = state ? 'ALLUMÉ' : 'ÉTEINT';
   }
 }
 
@@ -192,7 +204,10 @@ function showToast(msg, type = 'info') {
   setTimeout(() => toastEl.classList.remove('show'), 2500);
 }
 
-// Initialisation au chargement de la page
+// Initialisation au chargement
 document.addEventListener('DOMContentLoaded', () => {
+  // Crée les cartes immédiatement (avec état LOW par défaut)
+  renderCards();
+  // Puis tente la connexion WebSocket
   connectWebSocket();
 });
